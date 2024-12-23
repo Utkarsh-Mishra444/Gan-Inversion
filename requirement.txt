@@ -1,0 +1,11 @@
+# Core Dependencies
+numpy
+Pillow
+imageio
+scipy
+
+# Optional Dependencies for Colab
+# google-colab
+# pydrive
+# oauth2client
+# gdown
