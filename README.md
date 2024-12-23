@@ -1,4 +1,4 @@
-# GAN Inversion for Image Manipulation
+# GAN Inversion for Latent Space Analysis
 
 This project explores image manipulation through GAN (Generative Adversarial Network) inversion, specifically focusing on object rotation in car images. We leverage the `encoder4editing` framework, created by Omer Tov et al., to map images to a latent space, perform manipulations, and reconstruct the images. We thank the authors for providing the model and framework on which this project is built.
 
