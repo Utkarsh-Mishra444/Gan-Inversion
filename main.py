@@ -1,0 +1,261 @@
+import os
+import sys
+import time
+from argparse import Namespace, ArgumentParser
+import numpy as np
+from PIL import Image
+import torch
+import torchvision.transforms as transforms
+import glob
+from utils.common import tensor2im
+from models.psp import pSp
+from configs import data_configs
+from torch.utils.data import Dataset, DataLoader
+
+"""
+This script performs GAN inversion on a set of images using a pre-trained encoder.
+
+It loads a StyleGAN model and its corresponding encoder, maps input images to the latent space,
+and then reconstructs the images from the latent codes. This script provides a basic GAN
+inversion pipeline to test the model on a set of images, and also demonstrates how to
+load the pre-trained model.
+
+Example Usage:
+
+    python main.py --experiment_type cars_encode --image_directory "/path/to/your/images" --output_directory "/path/to/output_directory"
+"""
+
+def display_alongside_source_image(result_image, source_image, resize_dims):
+    """
+    Displays the source image and the generated image side by side.
+
+    Args:
+        result_image (PIL.Image.Image): The generated image.
+        source_image (PIL.Image.Image): The original source image.
+        resize_dims (tuple): The dimensions to resize both images to.
+
+    Returns:
+        PIL.Image.Image: The concatenated image for display.
+    """
+    res = np.concatenate([np.array(source_image.resize(resize_dims)),
+                          np.array(result_image.resize(resize_dims))], axis=1)
+    return Image.fromarray(res)
+
+def save_image(img, save_dir, idx):
+    """
+    Saves a single image to a given directory with a specific index.
+
+    Args:
+        img (torch.Tensor): The image tensor.
+        save_dir (str): The directory to save the image in.
+        idx (int): The index for the filename.
+    """
+    result = tensor2im(img)
+    im_save_path = os.path.join(save_dir, f"{idx:05d}.jpg")
+    Image.fromarray(np.array(result)).save(im_save_path)
+
+def generate_inversions(g, latent_codes, sno, is_cars, output_path):
+    """
+    Generates and saves inverted images from latent codes.
+
+    Args:
+        g (torch.nn.Module): The generator network (decoder).
+        latent_codes (torch.Tensor): The latent codes for the images.
+        sno (int): Starting number for saving the files.
+        is_cars (bool): Flag to indicate if the images are cars
+        output_path (str): The output directory to save the images to.
+    """
+    print('Saving inversion images')
+    inversions_directory_path = os.path.join(output_path, 'inversions')
+    os.makedirs(inversions_directory_path, exist_ok=True)
+    for i in range(len(latent_codes)):
+        imgs, _ = g([latent_codes[i].unsqueeze(0)], input_is_latent=True, randomize_noise=False, return_latents=True)
+        if is_cars:
+            imgs = imgs[:, :, 64:448, :]
+        save_image(imgs[0], inversions_directory_path, i + sno)
+
+def get_latents(net, x, is_cars=True):
+    """
+    Encodes input images to extract their latent codes using the model.
+
+    Args:
+        net (torch.nn.Module): The GAN inversion network (encoder+decoder).
+        x (torch.Tensor): The input image tensor.
+        is_cars (bool):  Flag to indicate if the images are cars
+
+    Returns:
+        torch.Tensor: The extracted latent codes.
+    """
+    codes = net(x, randomize_noise=False, return_latents=True)[1]
+    if codes.shape[1] == 18 and is_cars:
+        codes = codes[:, :16, :]
+    return codes
+
+class InferenceDataset(Dataset):
+    """
+    Custom Dataset for loading images for inference.
+
+    Args:
+        root (str): Path to the root folder containing images
+        opts : Options for the experiment
+        transform (torchvision.transforms): Transforms for the data
+        preprocess (func): function to preprocess data
+    """
+    def __init__(self, root, opts, transform=None, preprocess=None):
+        sys.path.append(os.path.join(os.getcwd(), "encoder4editing"))
+        from utils import data_utils
+        self.paths = sorted(data_utils.make_dataset(root))
+        self.transform = transform
+        self.preprocess = preprocess
+        self.opts = opts
+    def __len__(self):
+        return len(self.paths)
+    def __getitem__(self, index):
+        from_path = self.paths[index]
+        if self.preprocess is not None:
+            from_im = self.preprocess(from_path)
+        else:
+            from_im = Image.open(from_path).convert('RGB')
+        if self.transform:
+            from_im = self.transform(from_im)
+        return from_im
+
+def setup_data_loader(opts ,img_path):
+    """
+    Sets up the data loader for inference.
+
+    Args:
+        opts (argparse.Namespace): Command-line arguments and configuration.
+        img_path (str): The path to the directory with the images
+
+    Returns:
+        torch.utils.data.DataLoader: The data loader.
+    """
+    dataset_args = data_configs.DATASETS[opts.dataset_type]
+    transforms_dict = dataset_args['transforms'](opts).get_transforms()
+    images_path = img_path if img_path is not None else print('error in path')
+    print(f"images path: {images_path}")
+    align_function = None
+
+    test_dataset = InferenceDataset(root=images_path,
+                                    transform= EXPERIMENT_ARGS['transform'], #transforms_dict['transform_test'],
+                                    preprocess=align_function,
+                                    opts=opts)
+
+    data_loader = DataLoader(test_dataset,
+                             batch_size=1, #args.batch = 1
+                             shuffle=False,
+                             num_workers=2,
+                             drop_last=True)
+    print(f'dataset length: {len(test_dataset)}')
+    return data_loader
+
+@torch.no_grad()
+def get_all_latents(net, data_loader, n_images=None, is_cars=True):
+    """
+    Extracts the latent codes for all the images in a data loader.
+
+    Args:
+        net (torch.nn.Module): The GAN inversion network.
+        data_loader (torch.utils.data.DataLoader): The data loader.
+        n_images (int, optional): Max number of images to perform inversion. Defaults to None.
+        is_cars (bool): Boolean indicating if the images are cars, to select appropriate number of latent codes
+
+    Returns:
+         torch.Tensor: The concatenated latent codes for all images.
+    """
+    device='cuda'
+    all_latents = []
+    i = 0
+    with torch.no_grad():
+        for batch in data_loader:
+            if n_images is not None and i > n_images:
+                break
+            x = batch
+            inputs = x.to(device).float()
+            latents = get_latents(net, inputs, is_cars)
+            all_latents.append(latents)
+            i += len(latents)
+    return torch.cat(all_latents)
+
+
+if __name__ == '__main__':
+    parser = ArgumentParser(description="GAN Inversion and Latent Space Analysis")
+    parser.add_argument('--experiment_type', type=str, default='cars_encode',
+                        help='Experiment type: ffhq_encode, cars_encode, horse_encode, church_encode')
+    parser.add_argument('--image_directory', type=str, required=True,
+                        help='Path to the directory containing images.')
+    parser.add_argument('--output_directory', type = str, default="GAN_inversion_output",
+                        help='Path to the directory to output all of the generated images')
+
+    args = parser.parse_args()
+     # Configuration
+    experiment_type = args.experiment_type
+    MODEL_PATHS = {
+        "ffhq_encode": os.path.join("encoder4editing","pretrained_models/e4e_ffhq_encode.pt"),
+        "cars_encode": os.path.join("encoder4editing","pretrained_models/e4e_cars_encode.pt"),
+        "horse_encode": os.path.join("encoder4editing","pretrained_models/e4e_horse_encode.pt"),
+        "church_encode": os.path.join("encoder4editing","pretrained_models/e4e_church_encode.pt"),
+    }
+    IMAGE_PATHS = {
+        "ffhq_encode": os.path.join("encoder4editing", "notebooks/images/input_img.jpg"),
+        "cars_encode": os.path.join("encoder4editing", "notebooks/images/car_img.png"),
+        "horse_encode": os.path.join("encoder4editing", "notebooks/images/horse_img.jpg"),
+        "church_encode": os.path.join("encoder4editing", "notebooks/images/church_img.jpg"),
+    }
+    # Define paths
+    MODEL_PATHS = {
+        "ffhq_encode": {"id": "1cUv_reLE6k3604or78EranS7XzuVMWeO", "name": "e4e_ffhq_encode.pt"},
+        "cars_encode": {"id": "17faPqBce2m1AQeLCLHUVXaDfxMRU2QcV", "name": "e4e_cars_encode.pt"},
+        "horse_encode": {"id": "1TkLLnuX86B_BMo2ocYD0kX9kWh53rUVX", "name": "e4e_horse_encode.pt"},
+        "church_encode": {"id": "1-L0ZdnQLwtdy6-A_Ccgq5uNJGTqE7qBa", "name": "e4e_church_encode.pt"}
+    }
+    EXPERIMENT_DATA_ARGS = {
+    "ffhq_encode": {
+        "model_path": os.path.join("encoder4editing","pretrained_models/e4e_ffhq_encode.pt"),
+        "image_path": os.path.join("encoder4editing", "notebooks/images/input_img.jpg")
+    },
+    "cars_encode": {
+        "model_path": os.path.join("encoder4editing","pretrained_models/e4e_cars_encode.pt"),
+        "image_path": os.path.join("encoder4editing", "notebooks/images/car_img.png")
+    },
+    "horse_encode": {
+        "model_path": os.path.join("encoder4editing","pretrained_models/e4e_horse_encode.pt"),
+        "image_path": os.path.join("encoder4editing", "notebooks/images/horse_img.jpg")
+    },
+    "church_encode": {
+        "model_path": os.path.join("encoder4editing","pretrained_models/e4e_church_encode.pt"),
+        "image_path": os.path.join("encoder4editing", "notebooks/images/church_img.jpg")
+    }
+}
+    # Setup required image transformations
+    EXPERIMENT_ARGS = EXPERIMENT_DATA_ARGS[experiment_type]
+    if experiment_type == 'cars_encode':
+        EXPERIMENT_ARGS['transform'] = transforms.Compose([
+                transforms.Resize((192, 256)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])])
+        resize_dims = (256, 192)
+    else:
+        EXPERIMENT_ARGS['transform'] = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])])
+        resize_dims = (256, 256)
+    model_path = EXPERIMENT_ARGS['model_path']
+    ckpt = torch.load(model_path, map_location='cpu')
+    opts = ckpt['opts']
+    opts['checkpoint_path'] = model_path
+    opts= Namespace(**opts)
+    net = pSp(opts)
+    net.eval()
+    net.cuda()
+    print('Model successfully loaded!')
+
+    # Setup data loader
+    data_loader = setup_data_loader(opts ,img_path = args.image_directory)
+    # Get latent codes for all images
+    latent_codes = get_all_latents(net, data_loader, n_images=None, is_cars=(experiment_type == 'cars_encode'))
+    print(f"length of latent codes {len(latent_codes)}")
+    generate_inversions(net.decoder, latent_codes, 1, is_cars=(experiment_type == 'cars_encode'), output_path = args.output_directory)
+    print("All Image inversions have been generated")
